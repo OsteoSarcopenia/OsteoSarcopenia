@@ -1,0 +1,632 @@
+"""
+PART 1: TRAINING & VALIDATION SCRIPT (ALL OUTCOMES)
+
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import pickle
+import warnings
+from sklearn.utils import resample
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, StratifiedKFold, cross_val_predict
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import confusion_matrix, roc_auc_score, brier_score_loss, fbeta_score, make_scorer
+from sklearn.feature_selection import SelectFromModel
+from sklearn.calibration import CalibratedClassifierCV
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from imblearn.combine import SMOTEENN
+from imblearn.pipeline import Pipeline as ImbPipeline
+
+warnings.filterwarnings('ignore')
+
+# --- CONFIGURATION ---
+DATA_PATH = "data.csv"
+BASE_OUTPUT_DIR = "merged_outputs"
+
+def calculate_metrics(y_true, y_pred, y_pred_proba):
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    sens = tp / (tp + fn) if (tp + fn) > 0 else 0
+    spec = tn / (tn + fp) if (tn + fp) > 0 else 0
+    return {
+        'Sensitivity': sens, 'Specificity': spec,
+        'PPV': tp / (tp + fp) if (tp + fp) > 0 else 0,
+        'NPV': tn / (tn + fn) if (tn + fn) > 0 else 0,
+        'Accuracy': (tp + tn) / (tp + tn + fp + fn),
+        'Balanced_Acc': (sens + spec) / 2,
+        'F1': tp / (tp + 0.5 * (fp + fn)) if (tp + fp + fn) > 0 else 0,
+        'F2': fbeta_score(y_true, y_pred, beta=2, zero_division=0),
+        'AUC': roc_auc_score(y_true, y_pred_proba),
+        'Brier': brier_score_loss(y_true, y_pred_proba)
+    }
+
+def get_bootstrapped_cis_and_pval(y_true, y_pred, y_prob, y_prob_base=None, n_iterations=1000):
+    np.random.seed(42)
+    dist = {m: [] for m in ['Sensitivity', 'Specificity', 'PPV', 'NPV', 'Balanced_Acc', 'F1', 'F2', 'AUC', 'Brier']}
+    y_true_arr, y_pred_arr, y_prob_arr = np.array(y_true), np.array(y_pred), np.array(y_prob)
+    y_prob_base_arr = np.array(y_prob_base) if y_prob_base is not None else None
+    auc_diffs = []
+    
+    for _ in range(n_iterations):
+        idx = resample(np.arange(len(y_true_arr)))
+        y_t, y_p, y_pr = y_true_arr[idx], y_pred_arr[idx], y_prob_arr[idx]
+        if len(np.unique(y_t)) < 2: continue 
+        
+        met = calculate_metrics(y_t, y_p, y_pr)
+        for k in dist.keys(): dist[k].append(met[k])
+        
+        if y_prob_base_arr is not None:
+            auc_diffs.append(met['AUC'] - roc_auc_score(y_t, y_prob_base_arr[idx]))
+
+    results = {f"{k}_CI": f"{np.mean(v):.3f} [{np.percentile(v, 2.5):.3f}-{np.percentile(v, 97.5):.3f}]" for k, v in dist.items()}
+    if y_prob_base_arr is not None and len(auc_diffs) > 0:
+        p_val = np.sum(np.array(auc_diffs) <= 0) / len(auc_diffs)
+        results['p_value_vs_base'] = f"{p_val:.3f}" if p_val > 0 else "<0.001"
+    else:
+        results['p_value_vs_base'] = "Ref"
+    return results
+
+def build_pipeline(model, num_cols, cat_cols, use_smote, use_feat_sel=True):
+    preprocessor = ColumnTransformer([
+        ('num', Pipeline([('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())]), num_cols),
+        ('cat', Pipeline([('imputer', SimpleImputer(strategy='most_frequent')), 
+                          ('encoder', OneHotEncoder(drop='if_binary', handle_unknown='ignore', sparse_output=False))]), cat_cols)
+    ])
+    steps = [('preprocessor', preprocessor)]
+    
+    if use_feat_sel:
+        selector = SelectFromModel(LogisticRegression(penalty='l1', solver='saga', C=0.1, class_weight='balanced', random_state=42, max_iter=1000), max_features=15)
+        steps.append(('feature_selection', selector))
+        
+    if use_smote:
+        steps.append(('smote', SMOTEENN(random_state=42)))
+        
+    steps.append(('clf', model))
+    return ImbPipeline(steps)
+
+def tune_threshold_f2(y_train, prob_cv):
+    """Maximize F2 while keeping Sens >= 0.90."""
+    best_t = 0.5; best_score = -1; found_high_sens = False
+    for t in np.arange(0.1, 0.9, 0.01):
+        pred = (prob_cv >= t).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_train, pred).ravel()
+        sens = tp / (tp + fn + 1e-9)
+        f2 = fbeta_score(y_train, pred, beta=2, zero_division=0)
+        if sens >= 0.90 and f2 > best_score:
+            best_score = f2; best_t = t; found_high_sens = True
+    if not found_high_sens:
+        best_score = -1
+        for t in np.arange(0.1, 0.9, 0.01):
+            f2 = fbeta_score(y_train, (prob_cv >= t).astype(int), beta=2, zero_division=0)
+            if f2 > best_score: best_score = f2; best_t = t
+    return best_t
+
+def tune_threshold_spec(y_train, prob_cv):
+    """Maximize Sensitivity while keeping Specificity >= 0.35 (For High Prevalence)."""
+    best_t = 0.5; best_sens = -1; found_constraint = False
+    for t in np.arange(0.01, 0.99, 0.01):
+        pred = (prob_cv >= t).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_train, pred).ravel()
+        sens, spec = tp/(tp+fn+1e-9), tn/(tn+fp+1e-9)
+        if spec >= 0.35 and sens > best_sens:
+            best_sens = sens; best_t = t; found_constraint = True
+    if not found_constraint:
+        best_score = -1
+        for t in np.arange(0.01, 0.99, 0.01):
+            pred = (prob_cv >= t).astype(int)
+            tn, fp, fn, tp = confusion_matrix(y_train, pred).ravel()
+            if (tp/(tp+fn+1e-9) + tn/(tn+fp+1e-9)) > best_score:
+                best_score = (tp/(tp+fn+1e-9) + tn/(tn+fp+1e-9)); best_t = t
+    return best_t
+
+def run_standard_pipeline(df, target, folder_name, tuning_strategy='f2'):
+    print(f"\n{'='*80}\n🚀 TRAINING: {target.upper()}\n{'='*80}")
+    output_dir = os.path.join(BASE_OUTPUT_DIR, folder_name, "Whole_Cohort")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    excl = ['Code', 'Calcium','RBC','MCV','WBC', 'Unnamed: 0', 'Screening_Score', 'LSSM04_C', 'OSMU18', 'HiPR05', 
+            'ArmAround', 'Hipcm', 'ADLCLEAN', 'ADLWC', 'ADLBATH', 'ADLDISPLACE', 'ADLSTAIRS', 'ADLEAT', 
+            'osteoporosis', 'sarcopenia', 'osteosarcopenia', 'osteopenia', 'osteosarcopenias']
+    X = df[[c for c in df.columns if c not in excl and c != target]]
+    X = X.loc[:, X.nunique() > 1]
+    y = df[target]
+    
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    num_cols = [c for c in X.columns if X[c].dtype != 'object' and X[c].nunique() >= 10]
+    cat_cols = [c for c in X.columns if X[c].dtype == 'object' or X[c].nunique() < 10]
+    ratio = float(np.sum(y_train == 0)) / np.sum(y_train == 1)
+    
+    # Baseline
+    base_num = ['Age', 'BMI']
+    base_cat = ['Sex'] if 'Sex' in X.columns and X['Sex'].nunique() > 1 else []
+    pipe_base = build_pipeline(LogisticRegression(class_weight='balanced', random_state=42), base_num, base_cat, False, False)
+    
+    cal_base = CalibratedClassifierCV(estimator=pipe_base, method='sigmoid', cv=5, n_jobs=-1).fit(X_train, y_train)
+    prob_base_cv = cross_val_predict(cal_base, X_train, y_train, cv=StratifiedKFold(5), method='predict_proba', n_jobs=-1)[:, 1]
+    thresh_base = tune_threshold_f2(y_train, prob_base_cv) if tuning_strategy == 'f2' else tune_threshold_spec(y_train, prob_base_cv)
+    
+    pipe_base.fit(X_train, y_train) # Uncalibrated for SHAP
+    prob_base_te = cal_base.predict_proba(X_test)[:, 1]
+    
+    results = [{'Model': 'Baseline (Age+BMI+Sex)', 'Threshold': thresh_base, 
+                **calculate_metrics(y_test, (prob_base_te >= thresh_base).astype(int), prob_base_te), 
+                **get_bootstrapped_cis_and_pval(y_test, (prob_base_te >= thresh_base).astype(int), prob_base_te)}]
+    models_dict, probs_dict = {'Baseline (Age+BMI+Sex)': (pipe_base, thresh_base)}, {'Baseline (Age+BMI+Sex)': prob_base_te}
+    
+    # ML Models
+    grids = {
+        'Logistic Regression': (LogisticRegression(max_iter=1000, random_state=42), {'clf__C': [0.01, 0.1, 1], 'clf__class_weight': [None, 'balanced']}, True),
+        'MLP': (MLPClassifier(random_state=42, max_iter=1000, early_stopping=True), {'clf__hidden_layer_sizes': [(10,), (50,)], 'clf__alpha': [0.01, 0.1]}, True),
+        'Random Forest': (RandomForestClassifier(random_state=42, class_weight='balanced'), {'clf__n_estimators': [100, 300], 'clf__max_depth': [3, 5, 10], 'clf__min_samples_split': [5, 10]}, False),
+        'XGBoost': (XGBClassifier(eval_metric='logloss', random_state=42), {'clf__n_estimators': [100, 300], 'clf__max_depth': [3, 5], 'clf__learning_rate': [0.01, 0.05], 'clf__scale_pos_weight': [1, ratio]}, False),
+        'LightGBM': (LGBMClassifier(random_state=42, verbose=-1), {'clf__n_estimators': [100, 300], 'clf__max_depth': [3, 5], 'clf__learning_rate': [0.01, 0.05], 'clf__scale_pos_weight': [1, ratio]}, False)
+    }
+    
+    for name, (base, grid, use_smote) in grids.items():
+        print(f"    [+] Tuning & Calibrating: {name}...")
+        pipe = build_pipeline(base, num_cols, cat_cols, use_smote, True)
+        search = RandomizedSearchCV(pipe, grid, n_iter=15, cv=StratifiedKFold(5), scoring='roc_auc', n_jobs=-1, random_state=42).fit(X_train, y_train)
+        
+        cal = CalibratedClassifierCV(estimator=search.best_estimator_, method='sigmoid', cv=5, n_jobs=-1).fit(X_train, y_train)
+        prob_cv = cross_val_predict(cal, X_train, y_train, cv=StratifiedKFold(5), method='predict_proba', n_jobs=-1)[:, 1]
+        thresh = tune_threshold_f2(y_train, prob_cv) if tuning_strategy == 'f2' else tune_threshold_spec(y_train, prob_cv)
+        
+        search.best_estimator_.fit(X_train, y_train) # Uncalibrated for SHAP
+        prob_te = cal.predict_proba(X_test)[:, 1]
+        pred_te = (prob_te >= thresh).astype(int)
+        
+        metrics = calculate_metrics(y_test, pred_te, prob_te)
+        ci_pval = get_bootstrapped_cis_and_pval(y_test, pred_te, prob_te, prob_base_te)
+        results.append({'Model': name, 'Threshold': thresh, **metrics, **ci_pval})
+        models_dict[name], probs_dict[name] = (search.best_estimator_, thresh), prob_te
+
+    pd.DataFrame(results).to_csv(os.path.join(output_dir, f"Whole_Cohort_metrics.csv"), index=False)
+    with open(os.path.join(output_dir, f"Whole_Cohort_master_data.pkl"), 'wb') as f:
+        pickle.dump({'y_test': y_test, 'X_test': X_test, 'probs_dict': probs_dict, 'models_dict': models_dict}, f)
+
+def run_osteosarcopenia(df):
+    print(f"\n{'='*80}\n🚀 TRAINING: OSTEOSARCOPENIA (DIRECT & META-LEARNERS)\n{'='*80}")
+    output_dir = os.path.join(BASE_OUTPUT_DIR, "osteosarcopenia", "Whole_Cohort")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    excl = ['Code', 'Calcium', 'RBC', 'MCV', 'WBC', 'Unnamed: 0', 'Screening_Score', 'LSSM04_C', 'OSMU18', 'HiPR05', 
+            'ArmAround', 'Hipcm', 'ADLCLEAN', 'ADLWC', 'ADLBATH', 'ADLDISPLACE', 'ADLSTAIRS', 'ADLEAT', 
+            'osteoporosis', 'sarcopenia', 'osteosarcopenia', 'osteopenia', 'osteosarcopenias']
+    X = df[[c for c in df.columns if c not in excl]]
+    X = X.loc[:, X.nunique() > 1]
+    
+    # Unified Split mapping
+    X_train, X_test, y_train_combo, y_test_combo, y_train_bone, _, y_train_muscle, _ = train_test_split(
+        X, df['osteosarcopenia'], df['osteopenia'], df['sarcopenia'], test_size=0.2, random_state=42, stratify=df['osteosarcopenia'])
+    
+    num_cols = [c for c in X.columns if X[c].dtype != 'object' and X[c].nunique() >= 10]
+    cat_cols = [c for c in X.columns if X[c].dtype == 'object' or X[c].nunique() < 10]
+    ratio = float(np.sum(y_train_combo == 0)) / np.sum(y_train_combo == 1)
+    
+    results, models_dict, probs_dict = [], {}, {}
+    
+    # Baselines
+    base_num, base_cat = ['Age', 'BMI'], ['Sex']
+    pipe_base = build_pipeline(LogisticRegression(class_weight='balanced', random_state=42), base_num, base_cat, False, False)
+    
+    # Direct Baseline
+    cal_base = CalibratedClassifierCV(estimator=pipe_base, method='sigmoid', cv=5, n_jobs=-1).fit(X_train, y_train_combo)
+    t_base_dir = tune_threshold_f2(y_train_combo, cross_val_predict(cal_base, X_train, y_train_combo, cv=5, method='predict_proba')[:, 1])
+    pipe_base.fit(X_train, y_train_combo)
+    prob_te_base_dir = cal_base.predict_proba(X_test)[:, 1]
+    
+    results.append({'Model': 'Direct Baseline (Age+BMI+Sex)', 'Threshold': t_base_dir, **calculate_metrics(y_test_combo, (prob_te_base_dir >= t_base_dir).astype(int), prob_te_base_dir), **get_bootstrapped_cis_and_pval(y_test_combo, (prob_te_base_dir >= t_base_dir).astype(int), prob_te_base_dir)})
+    models_dict['Direct Baseline (Age+BMI+Sex)'], probs_dict['Direct Baseline (Age+BMI+Sex)'] = (pipe_base, t_base_dir), prob_te_base_dir
+
+    # Combined Baseline
+    pipe_base.fit(X_train, y_train_bone)
+    bone_oof_base = cross_val_predict(pipe_base, X_train, y_train_bone, cv=5, method='predict_proba')[:, 1]
+    bone_test_base = pipe_base.predict_proba(X_test)[:, 1]
+
+    pipe_base.fit(X_train, y_train_muscle)
+    muscle_oof_base = cross_val_predict(pipe_base, X_train, y_train_muscle, cv=5, method='predict_proba')[:, 1]
+    muscle_test_base = pipe_base.predict_proba(X_test)[:, 1]
+
+    meta_base = CalibratedClassifierCV(LogisticRegression(class_weight='balanced', random_state=42), cv=5).fit(np.column_stack((bone_oof_base, muscle_oof_base)), y_train_combo)
+    t_meta_base = tune_threshold_f2(y_train_combo, cross_val_predict(meta_base, np.column_stack((bone_oof_base, muscle_oof_base)), y_train_combo, cv=5, method='predict_proba')[:, 1])
+    prob_meta_test_base = meta_base.predict_proba(np.column_stack((bone_test_base, muscle_test_base)))[:, 1]
+    
+    results.append({'Model': 'Combined Baseline (Age+BMI+Sex)', 'Threshold': t_meta_base, **calculate_metrics(y_test_combo, (prob_meta_test_base >= t_meta_base).astype(int), prob_meta_test_base), **get_bootstrapped_cis_and_pval(y_test_combo, (prob_meta_test_base >= t_meta_base).astype(int), prob_meta_test_base)})
+    probs_dict['Combined Baseline (Age+BMI+Sex)'] = prob_meta_test_base
+
+    # ML Grids
+    grids = {
+        'Logistic Regression': (LogisticRegression(max_iter=1000, random_state=42), {'clf__C': [0.01, 0.1, 1], 'clf__class_weight': [None, 'balanced']}, True),
+        'MLP': (MLPClassifier(random_state=42, max_iter=1000, early_stopping=True), {'clf__hidden_layer_sizes': [(10,), (50,)], 'clf__alpha': [0.01, 0.1]}, True),
+        'Random Forest': (RandomForestClassifier(random_state=42, class_weight='balanced'), {'clf__n_estimators': [100, 300], 'clf__max_depth': [3, 5, 10]}, False),
+        'XGBoost': (XGBClassifier(eval_metric='logloss', random_state=42), {'clf__n_estimators': [100, 300], 'clf__max_depth': [3, 5], 'clf__learning_rate': [0.01, 0.05], 'clf__scale_pos_weight': [1, ratio]}, False),
+        'LightGBM': (LGBMClassifier(random_state=42, verbose=-1), {'clf__n_estimators': [100, 300], 'clf__max_depth': [3, 5], 'clf__learning_rate': [0.01, 0.05], 'clf__scale_pos_weight': [1, ratio]}, False)
+    }
+
+    bone_oof, bone_test, muscle_oof, muscle_test = {}, {}, {}, {}
+
+    print("    [+] Training DIRECT ML Models...")
+    for name, (base, grid, use_smote) in grids.items():
+        pipe = build_pipeline(base, num_cols, cat_cols, use_smote, True)
+        search = RandomizedSearchCV(pipe, grid, n_iter=15, cv=StratifiedKFold(5), scoring='roc_auc', n_jobs=-1, random_state=42).fit(X_train, y_train_combo)
+        cal = CalibratedClassifierCV(estimator=search.best_estimator_, cv=5, n_jobs=-1).fit(X_train, y_train_combo)
+        thresh = tune_threshold_f2(y_train_combo, cross_val_predict(cal, X_train, y_train_combo, cv=5, method='predict_proba', n_jobs=-1)[:, 1])
+        
+        search.best_estimator_.fit(X_train, y_train_combo)
+        prob_te = cal.predict_proba(X_test)[:, 1]
+        
+        results.append({'Model': f"Direct {name}", 'Threshold': thresh, **calculate_metrics(y_test_combo, (prob_te >= thresh).astype(int), prob_te), **get_bootstrapped_cis_and_pval(y_test_combo, (prob_te >= thresh).astype(int), prob_te, prob_te_base_dir)})
+        models_dict[f"Direct {name}"], probs_dict[f"Direct {name}"] = (search.best_estimator_, thresh), prob_te
+
+    print("    [+] Generating BONE & MUSCLE Sub-Models...")
+    for name, (base, grid, use_smote) in grids.items():
+        pipe = build_pipeline(base, num_cols, cat_cols, use_smote, True)
+        b_est = RandomizedSearchCV(pipe, grid, n_iter=10, cv=3, scoring='roc_auc', n_jobs=-1, random_state=42).fit(X_train, y_train_bone).best_estimator_
+        bone_oof[name] = cross_val_predict(b_est, X_train, y_train_bone, cv=5, method='predict_proba', n_jobs=-1)[:, 1]
+        b_est.fit(X_train, y_train_bone)
+        bone_test[name] = b_est.predict_proba(X_test)[:, 1]
+
+        m_est = RandomizedSearchCV(pipe, grid, n_iter=10, cv=3, scoring='roc_auc', n_jobs=-1, random_state=42).fit(X_train, y_train_muscle).best_estimator_
+        muscle_oof[name] = cross_val_predict(m_est, X_train, y_train_muscle, cv=5, method='predict_proba', n_jobs=-1)[:, 1]
+        m_est.fit(X_train, y_train_muscle)
+        muscle_test[name] = m_est.predict_proba(X_test)[:, 1]
+
+    print("    [+] Training 25 COMBINED Meta-Learners...")
+    for b_name in grids.keys():
+        for m_name in grids.keys():
+            c_name = f"Combined: {b_name} (Bone) + {m_name} (Muscle)"
+            meta = CalibratedClassifierCV(LogisticRegression(class_weight='balanced', random_state=42), cv=5).fit(np.column_stack((bone_oof[b_name], muscle_oof[m_name])), y_train_combo)
+            t_meta = tune_threshold_f2(y_train_combo, cross_val_predict(meta, np.column_stack((bone_oof[b_name], muscle_oof[m_name])), y_train_combo, cv=5, method='predict_proba')[:, 1])
+            prob_te = meta.predict_proba(np.column_stack((bone_test[b_name], muscle_test[m_name])))[:, 1]
+            
+            results.append({'Model': c_name, 'Threshold': t_meta, **calculate_metrics(y_test_combo, (prob_te >= t_meta).astype(int), prob_te), **get_bootstrapped_cis_and_pval(y_test_combo, (prob_te >= t_meta).astype(int), prob_te, prob_meta_test_base)})
+            probs_dict[c_name] = prob_te
+
+    pd.DataFrame(results).to_csv(os.path.join(output_dir, "Whole_Cohort_metrics.csv"), index=False)
+    with open(os.path.join(output_dir, "Whole_Cohort_master_data.pkl"), 'wb') as f:
+        pickle.dump({'y_test': y_test_combo, 'X_test': X_test, 'probs_dict': probs_dict, 'models_dict': models_dict}, f)
+
+def main():
+    df = pd.read_csv(DATA_PATH).dropna(subset=['osteoporosis', 'sarcopenia', 'osteopenia', 'osteosarcopenia'])
+    for col in ['HiPR02', 'HiPR03', 'HiPR05', 'HiPR06']: 
+        if col in df.columns: df[col] = df[col].fillna(0)
+            
+    run_standard_pipeline(df, "osteoporosis", "osteoporosis", tuning_strategy='f2')
+    run_standard_pipeline(df, "sarcopenia", "sarcopenia", tuning_strategy='f2')
+    run_standard_pipeline(df, "osteopenia", "low_bone_mass", tuning_strategy='spec')
+    run_osteosarcopenia(df)
+    print("\n[+] SUCCESS! ALL FOUR OUTCOMES PROCESSED PERFECTLY.")
+
+if __name__ == "__main__":
+    main()
+
+# ==============================================================================
+
+# ==============================================================================
+
+"""
+PART 2: MANUSCRIPT FIGURE & TABLE GENERATION SCRIPT
+
+"""
+
+import os
+import pickle
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import shap
+import glob
+from sklearn.metrics import roc_curve, auc, precision_recall_curve, brier_score_loss, confusion_matrix
+from sklearn.calibration import calibration_curve
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# ==============================================================================
+# --- CONFIGURATION ---
+# ==============================================================================
+
+BASE_DIR = "merged_outputs"
+FIG_DIR = os.path.join(BASE_DIR, "figures")
+os.makedirs(FIG_DIR, exist_ok=True)
+
+OUTCOMES = {
+    "Osteoporosis": {
+        "pkl": os.path.join(BASE_DIR, "osteoporosis", "Whole_Cohort", "Whole_Cohort_master_data.pkl"),
+        "models": ["Baseline (Age+BMI+Sex)", "Random Forest", "XGBoost", "LightGBM"],
+        "shap_model": "Random Forest",
+        "fig_num": 1
+    },
+    "Sarcopenia": {
+        "pkl": os.path.join(BASE_DIR, "sarcopenia", "Whole_Cohort", "Whole_Cohort_master_data.pkl"),
+        "models": ["Baseline (Age+BMI+Sex)", "XGBoost", "Logistic Regression", "MLP"],
+        "shap_model": "XGBoost",
+        "fig_num": 2
+    },
+    "Low Bone Mass": {
+        "pkl": os.path.join(BASE_DIR, "low_bone_mass", "Whole_Cohort", "Whole_Cohort_master_data.pkl"),
+        "models": ["Baseline (Age+BMI+Sex)", "LightGBM", "XGBoost", "Logistic Regression"],
+        "shap_model": "LightGBM",
+        "fig_num": 3
+    },
+    "Osteosarcopenia": {
+        "pkl": os.path.join(BASE_DIR, "osteosarcopenia", "Whole_Cohort", "Whole_Cohort_master_data.pkl"),
+        "models": ["Direct Baseline (Age+BMI+Sex)", "Combined Baseline (Age+BMI+Sex)", "Direct XGBoost", "Direct LightGBM", "Direct MLP", 
+                   "Combined: MLP (Bone) + XGBoost (Muscle)", "Combined: MLP (Bone) + LightGBM (Muscle)", "Combined: Logistic Regression (Bone) + MLP (Muscle)"],
+        "shap_model": "Direct LightGBM",
+        "fig_num": 4
+    }
+}
+
+plt.rcParams.update({
+    'font.size': 12, 'axes.titlesize': 14, 'axes.labelsize': 12,
+    'legend.fontsize': 10, 'xtick.labelsize': 11, 'ytick.labelsize': 11,
+    'figure.titlesize': 16, 'font.family': 'sans-serif'
+})
+sns.set_style("whitegrid")
+
+# ==============================================================================
+# --- PLOTTING HELPER FUNCTIONS ---
+# ==============================================================================
+
+def add_panel_label(ax, label):
+    ax.text(-0.1, 1.05, label, transform=ax.transAxes, fontsize=20, fontweight='bold', va='top', ha='right')
+
+def get_style(name):
+    if "Combined" in name: return 3.0, '-'
+    elif "Baseline" in name: return 2.0, ':'
+    else: return 2.5, '--'
+
+def generate_outcome_figure(outcome_name, config):
+    print(f"[+] Generating Figure {config['fig_num']} for {outcome_name}...")
+    if not os.path.exists(config['pkl']):
+        print(f"    [!] Error: {config['pkl']} not found.")
+        return
+        
+    with open(config['pkl'], 'rb') as f: data = pickle.load(f)
+    y_test, probs_dict = data['y_test'], {m: data['probs_dict'][m] for m in config['models'] if m in data['probs_dict']}
+    fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+    colors = sns.color_palette("Set1", len(probs_dict))
+    
+    # A: ROC
+    ax = axes[0, 0]
+    add_panel_label(ax, 'A')
+    for (name, y_prob), color in zip(probs_dict.items(), colors):
+        fpr, tpr, _ = roc_curve(y_test, y_prob)
+        lw, ls = get_style(name)
+        ax.plot(fpr, tpr, lw=lw, ls=ls, color=color, label=f"{name} (AUC = {auc(fpr, tpr):.3f})")
+    ax.plot([0, 1], [0, 1], 'k--', lw=1.5)
+    ax.set_xlabel('False Positive Rate'); ax.set_ylabel('True Positive Rate')
+    ax.set_title('Receiver Operating Characteristic (ROC)')
+    ax.legend(loc='lower right')
+
+    # B: PRC
+    ax = axes[0, 1]
+    add_panel_label(ax, 'B')
+    for (name, y_prob), color in zip(probs_dict.items(), colors):
+        prec, rec, _ = precision_recall_curve(y_test, y_prob)
+        lw, ls = get_style(name)
+        ax.plot(rec, prec, lw=lw, ls=ls, color=color, label=name)
+    ax.set_xlabel('Recall (Sensitivity)'); ax.set_ylabel('Precision (PPV)')
+    ax.set_title('Precision-Recall Curve (PRC)')
+    ax.legend(loc='upper right')
+
+    # C: Calibration
+    ax = axes[1, 0]
+    add_panel_label(ax, 'C')
+    ax.plot([0, 1], [0, 1], "k:", label="Perfectly Calibrated")
+    ax_hist = inset_axes(ax, width="40%", height="30%", loc="lower right", borderpad=2)
+    for (name, y_prob), color in zip(probs_dict.items(), colors):
+        prob_t, prob_p = calibration_curve(y_test, y_prob, n_bins=10)
+        lw, ls = get_style(name)
+        ax.plot(prob_p, prob_t, ls=ls, lw=lw, marker="s", color=color, label=f"{name} (Brier = {brier_score_loss(y_test, y_prob):.3f})")
+        ax_hist.hist(y_prob, range=(0, 1), bins=10, histtype="step", lw=1.5, color=color)
+    ax.set_xlabel('Predicted Probability'); ax.set_ylabel('Actual Fraction of Positives')
+    ax.set_title('Calibration Curve')
+    ax.legend(loc='upper left')
+    ax_hist.set_yticks([]); ax_hist.set_xlabel('Prob', fontsize=8); ax_hist.tick_params(axis='x', labelsize=8)
+
+    # D: DCA
+    ax = axes[1, 1]
+    add_panel_label(ax, 'D')
+    thresholds = np.linspace(0.01, 0.99, 100)
+    prevalence = np.mean(y_test)
+    ax.plot(thresholds, [prevalence - (1 - prevalence) * (t / (1 - t)) for t in thresholds], 'k--', label='Treat All')
+    ax.plot(thresholds, np.zeros_like(thresholds), 'k-', label='Treat None')
+    for (name, y_prob), color in zip(probs_dict.items(), colors):
+        nb_list = [(np.sum((y_prob >= t) & (y_test == 1)) / len(y_test)) - (np.sum((y_prob >= t) & (y_test == 0)) / len(y_test)) * (t / (1 - t)) for t in thresholds]
+        lw, ls = get_style(name)
+        ax.plot(thresholds, nb_list, lw=lw, ls=ls, color=color, label=name)
+    ax.set_ylim([-0.05, max(prevalence + 0.05, 0.25)]); ax.set_xlim([0, 0.85])
+    ax.set_xlabel('Threshold Probability'); ax.set_ylabel('Net Benefit')
+    ax.set_title('Decision Curve Analysis (DCA)')
+    ax.legend(loc='upper right')
+
+    plt.suptitle(f"Figure {config['fig_num']}: Predictive Performance for {outcome_name}", y=1.02, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, f"Figure_{config['fig_num']}_{outcome_name.replace(' ', '_')}_Summary.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+# ==============================================================================
+# --- SHAP COMPOSITE FIGURE ---
+# ==============================================================================
+
+def generate_shap_figure():
+    print(f"\n[+] Generating Figure 5: Composite SHAP Analysis...")
+    fig = plt.figure(figsize=(20, 18))
+    panels = ['A', 'B', 'C', 'D']
+    
+    for i, (outcome_name, config) in enumerate(OUTCOMES.items()):
+        if not os.path.exists(config['pkl']): continue
+        with open(config['pkl'], 'rb') as f: data = pickle.load(f)
+        model_name = config['shap_model']
+        if model_name not in data['models_dict']: continue
+            
+        pipe = data['models_dict'][model_name][0]
+        preprocessor, selector, clf = pipe.named_steps['preprocessor'], pipe.named_steps['feature_selection'], pipe.named_steps['clf']
+        
+        all_features = np.concatenate([preprocessor.transformers_[0][2], preprocessor.named_transformers_['cat'].named_steps['encoder'].get_feature_names_out(preprocessor.transformers_[1][2])])
+        clean_features = [f.replace('num__', '').replace('cat__', '') for f in all_features[selector.get_support()]]
+        X_test_transformed = selector.transform(preprocessor.transform(data['X_test']))
+        X_test_display = pd.DataFrame(X_test_transformed, columns=clean_features)
+        
+        if any(tree in model_name for tree in ["XGBoost", "Random Forest", "LightGBM"]):
+            shap_values = shap.TreeExplainer(clf).shap_values(X_test_transformed)
+            if isinstance(shap_values, list): shap_values = shap_values[1]
+            elif len(np.shape(shap_values)) == 3: shap_values = shap_values[:, :, 1]
+        elif "Logistic" in model_name:
+            shap_values = shap.LinearExplainer(clf, X_test_transformed).shap_values(X_test_transformed)
+        else:
+            shap_values = shap.KernelExplainer(lambda x: clf.predict_proba(x)[:, 1], shap.kmeans(X_test_transformed, 10)).shap_values(X_test_transformed)
+            if isinstance(shap_values, list): shap_values = shap_values[1]
+
+        ax = fig.add_subplot(2, 2, i+1); plt.sca(ax)
+        shap.summary_plot(shap_values, X_test_display, show=False, plot_size=None)
+        ax.set_title(f"{outcome_name} ({model_name})", fontsize=16, fontweight='bold', pad=20)
+        ax.text(-0.2, 1.05, panels[i], transform=ax.transAxes, fontsize=24, fontweight='bold', va='top', ha='right')
+
+    plt.suptitle("Figure 5: Biological Interpretability and Feature Importance (SHAP)", y=1.02, fontsize=22, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, "Figure_5_SHAP_Composite.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+    print("[+] Figure 5 saved successfully.")
+
+# ==============================================================================
+# --- CONFUSION MATRIX FIGURES ---
+# ==============================================================================
+
+def _plot_cm_grid(y_test, probs_dict, models_dict, model_names, outcome_name, sub_label, config):
+    """Helper function to plot a grid of confusion matrices."""
+    if not model_names: return
+    
+    cols = 2
+    rows = (len(model_names) + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(cols*6, rows*5))
+    
+    # Handle single model cases gracefully
+    if len(model_names) == 1: axes = [axes]
+    else: axes = axes.flatten()
+    
+    # Robustly find the corresponding metrics CSV for threshold fallback
+    pkl_dir = os.path.dirname(config['pkl'])
+    csv_files = glob.glob(os.path.join(pkl_dir, "*metrics.csv"))
+    df_metrics = pd.read_csv(csv_files[0]) if csv_files else None
+
+    for i, name in enumerate(model_names):
+        y_prob = probs_dict[name]
+        
+        # Fetch the exact optimized threshold
+        thresh = 0.5
+        if name in models_dict:
+            thresh = models_dict[name][1]
+        elif df_metrics is not None:
+            match = df_metrics[df_metrics['Model'] == name]
+            if not match.empty:
+                thresh = match['Threshold'].values[0]
+                
+        y_pred = (y_prob >= thresh).astype(int)
+        cm = confusion_matrix(y_test, y_pred)
+        
+        ax = axes[i]
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax, cbar=False,
+                    xticklabels=['Normal', outcome_name], yticklabels=['Normal', outcome_name],
+                    annot_kws={"size": 16, "fontweight": "bold"})
+        
+        title_text = f"{name}\n(Threshold: {thresh:.2f})"
+        ax.set_title(title_text, fontsize=14, fontweight='bold', pad=15)
+        ax.set_ylabel('Actual Label', fontsize=12, fontweight='bold')
+        ax.set_xlabel('Predicted Label', fontsize=12, fontweight='bold')
+        
+    for j in range(len(model_names), len(axes)): axes[j].set_visible(False)
+    
+    title_suffix = f" - {sub_label}" if sub_label else ""
+    plt.suptitle(f"Confusion Matrices: {outcome_name}{title_suffix}", y=1.02, fontsize=18, fontweight='bold')
+    plt.tight_layout()
+    
+    file_suffix = f"_{sub_label}" if sub_label else ""
+    save_path = os.path.join(FIG_DIR, f"Figure_S{config['fig_num']}_{outcome_name.replace(' ', '_')}{file_suffix}_CM.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"    [+] Saved {os.path.basename(save_path)}")
+
+def generate_outcome_cm_figures():
+    print(f"\n[+] Generating Individual Confusion Matrix Figures for each outcome...")
+    
+    for outcome_name, config in OUTCOMES.items():
+        pkl_path = config['pkl']
+        if not os.path.exists(pkl_path): continue
+        
+        with open(pkl_path, 'rb') as f: data = pickle.load(f)
+        y_test = data['y_test']
+        probs_dict = data['probs_dict']
+        models_dict = data['models_dict']
+        
+        models_to_plot = [m for m in config['models'] if m in probs_dict]
+        if not models_to_plot: continue
+
+        # For Osteosarcopenia, split Direct and Combined into two distinct figures
+        if outcome_name == "Osteosarcopenia":
+            direct_models = [m for m in models_to_plot if "Direct" in m]
+            combined_models = [m for m in models_to_plot if "Combined" in m]
+            
+            _plot_cm_grid(y_test, probs_dict, models_dict, direct_models, outcome_name, "Direct", config)
+            _plot_cm_grid(y_test, probs_dict, models_dict, combined_models, outcome_name, "Combined", config)
+        else:
+            # For everything else, plot them together in one figure
+            _plot_cm_grid(y_test, probs_dict, models_dict, models_to_plot, outcome_name, "", config)
+
+# ==============================================================================
+# --- MASTER CSV CONSOLIDATION ---
+# ==============================================================================
+
+def consolidate_metrics():
+    print("\n[+] Generating Master Metrics Table...")
+    all_dataframes = []
+    outcomes_map = {"osteoporosis": "Osteoporosis", "sarcopenia": "Sarcopenia", "low_bone_mass": "Low Bone Mass", "osteosarcopenia": "Osteosarcopenia"}
+    
+    for folder_name, outcome_label in outcomes_map.items():
+        search_pattern = os.path.join(BASE_DIR, folder_name, "Whole_Cohort", "*metrics.csv")
+        csv_files = glob.glob(search_pattern)
+        if not csv_files: continue
+            
+        df = pd.read_csv(csv_files[0])
+        df.insert(0, 'Outcome', outcome_label)
+        
+        ci_cols = [col for col in df.columns if str(col).endswith('_CI')]
+        for ci_col in ci_cols:
+            base_name = ci_col.replace('_CI', '')
+            if base_name in df.columns: df = df.drop(columns=[base_name])
+            df = df.rename(columns={ci_col: base_name})
+            
+        if 'Threshold' in df.columns: df['Threshold'] = df['Threshold'].apply(lambda x: round(x, 2) if pd.notnull(x) else x)
+        all_dataframes.append(df)
+
+    if not all_dataframes: return
+    
+    master_df = pd.concat(all_dataframes, ignore_index=True)
+    pref_cols = ['Outcome', 'Model', 'Threshold', 'AUC', 'Sensitivity', 'Specificity', 'PPV', 'NPV', 'Balanced_Acc', 'Accuracy', 'F1', 'F2', 'Brier', 'p_value_vs_base']
+    master_df = master_df[[col for col in pref_cols if col in master_df.columns] + [col for col in master_df.columns if col not in pref_cols]].fillna("-")
+    master_df.to_csv(os.path.join(FIG_DIR, "Master_Compiled_Metrics_Table.csv"), index=False)
+
+if __name__ == "__main__":
+    print("="*80)
+    print("STARTING MANUSCRIPT FIGURE & TABLE GENERATION")
+    print("="*80)
+    
+    for outcome, config in OUTCOMES.items(): 
+        generate_outcome_figure(outcome, config)
+        
+    generate_shap_figure()
+    generate_outcome_cm_figures() 
+    consolidate_metrics()
+    
+    print("\n" + "="*80 + "\n All manuscript figures and tables generated.\n" + "="*80)
